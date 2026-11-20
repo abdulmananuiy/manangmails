@@ -28,6 +28,14 @@ for (const f of [".env.local", ".env"]) {
 const PORT = process.env.TEST_PORT ? parseInt(process.env.TEST_PORT, 10) : 3101;
 const BASE = `http://127.0.0.1:${PORT}`;
 const INBOUND_SECRET = process.env.INBOUND_API_SECRET || "test-inbound-secret";
+const FE_WEBHOOK_TOKEN = process.env.FORWARDEMAIL_WEBHOOK_TOKEN || "test-forwardemail-token";
+// Reverse-DNS stub for the ForwardEmail sender check (see
+// src/lib/forwardemail-verify.ts): only honored when NODE_ENV is not
+// "production", so the dev server uses it and production never does.
+const FE_DNS_STUB = JSON.stringify({
+  "203.0.113.10": ["dns.google"],
+  "203.0.113.20": ["mx1.forwardemail.net"],
+});
 const SETUP_TOKEN = process.env.SETUP_TOKEN || "test-setup-token";
 // By default tests run against an in-memory Postgres emulator (pg-mem), so no
 // local Postgres is needed. Set USE_REAL_DB=1 to test against DATABASE_URL.
@@ -118,6 +126,8 @@ async function main() {
           ? { PG_MEM: "1", DATABASE_URL: "postgres://test:test@localhost:5432/test" }
           : {}),
         INBOUND_API_SECRET: INBOUND_SECRET,
+        FORWARDEMAIL_WEBHOOK_TOKEN: FE_WEBHOOK_TOKEN,
+        FORWARDEMAIL_DNS_STUB: FE_DNS_STUB,
         SETUP_TOKEN: SETUP_TOKEN,
         SESSION_SECRET:
           process.env.SESSION_SECRET || "test-session-secret-min-32-chars-long!!",
@@ -349,6 +359,47 @@ async function main() {
       "ForwardEmail HTML sanitized (no <script>, no remote <img>)",
       r.status === 200 && !/<script/i.test(feHtml) && !/tracker\.example\.com/.test(feHtml) && /739201/.test(feHtml),
       `html=${feHtml.slice(0, 120)}`
+    );
+
+    // 15b. ForwardEmail sender verification (dedicated token + reverse DNS)
+    // The webhook URL is public (DNS TXT record), so the adapter also
+    // verifies the sender IP. Tests control reverse DNS via the
+    // FORWARDEMAIL_DNS_STUB env var (see src/lib/forwardemail-verify.ts).
+    const fePathDedicated = `/api/inbound-email/forwardemail?token=${FE_WEBHOOK_TOKEN}`;
+
+    r = await req(null, fePathDedicated, "POST", fePayload(`<69ad5fc2-${stamp}-fe-dedicated@example.net>`, [address]));
+    check(
+      "ForwardEmail webhook accepts the dedicated FORWARDEMAIL_WEBHOOK_TOKEN (200)",
+      r.status === 200 && r.data.results?.[0]?.status === "stored",
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    r = await req(null, fePath, "POST", fePayload(`<69ad5fc2-${stamp}-fe-bad-ip@example.net>`, [address]), { "x-forwarded-for": "203.0.113.10" });
+    check(
+      "ForwardEmail webhook with valid token but non-ForwardEmail sender IP rejected (401)",
+      r.status === 401,
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    r = await req(null, fePath, "POST", fePayload(`<69ad5fc2-${stamp}-fe-good-ip@example.net>`, [address]), { "x-forwarded-for": "203.0.113.20" });
+    check(
+      "ForwardEmail webhook with valid token and mx1.forwardemail.net sender IP accepted (200)",
+      r.status === 200 && r.data.results?.[0]?.status === "stored",
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    r = await req(null, fePath, "POST", fePayload(`<69ad5fc2-${stamp}-fe-no-headers@example.net>`, [address]));
+    check(
+      "ForwardEmail webhook with valid token and no forwarding headers accepted via test-mode bypass (200)",
+      r.status === 200 && r.data.results?.[0]?.status === "stored",
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    r = await req(null, fePath, "POST", fePayload(`<69ad5fc2-${stamp}-fe-no-ptr@example.net>`, [address]), { "x-forwarded-for": "203.0.113.99" });
+    check(
+      "ForwardEmail webhook with valid token but unresolvable sender IP rejected (401)",
+      r.status === 401,
+      `status=${r.status} ${JSON.stringify(r.data)}`
     );
 
     // 16. Normal user cannot access admin APIs

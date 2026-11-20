@@ -3,12 +3,25 @@
 // ForwardEmail (free plan) POSTs each incoming email as JSON — the output of
 // mailparser's simpleParser — to the webhook URL configured in a DNS TXT
 // record. The free plan sends no X-Webhook-Signature header, so this route
-// authenticates with a secret query parameter instead:
+// authenticates in TWO ways, and a request must pass BOTH:
 //
-//   https://manangmails.netlify.app/api/inbound-email/forwardemail?token=<INBOUND_API_SECRET>
+//   1. Token: ?token= must match FORWARDEMAIL_WEBHOOK_TOKEN (the token
+//      published in the public DNS TXT record), or INBOUND_API_SECRET as
+//      a fallback so direct callers and existing tests keep working. The
+//      token is compared with timingSafeEqual and is never logged. The
+//      token alone is NOT sufficient — it is public by design, because
+//      the webhook URL lives in a public DNS TXT record.
+//   2. Sender IP: the connecting IP (see src/lib/forwardemail-verify.ts)
+//      must reverse-resolve to mx1.forwardemail.net or mx2.forwardemail.net
+//      (ForwardEmail's documented free-plan verification). A lookup that
+//      fails, times out (~3s), or returns no allowed hostname is rejected
+//      (401); ForwardEmail retries failed deliveries. When NO forwarding
+//      headers are present at all (local dev, tests, direct curl) the IP
+//      check is skipped and the token alone authenticates — in production
+//      behind Netlify the edge always sets x-nf-client-connection-ip, so
+//      the bypass never triggers there.
 //
-// The token is compared to INBOUND_API_SECRET with timingSafeEqual; a
-// wrong or missing token is rejected (401) and the token is never logged.
+//   https://manangmails.netlify.app/api/inbound-email/forwardemail?token=<FORWARDEMAIL_WEBHOOK_TOKEN>
 //
 // Payload shape (mailparser output): attachments[], headers, headerLines[],
 // html, text, textAsHtml, date (ISO string), from/to { value: [{ address,
@@ -42,6 +55,7 @@ import { createHash } from "crypto";
 import { clientIp, rateLimit } from "@/lib/rate-limit";
 import { error, json } from "@/lib/api";
 import { htmlToText } from "@/lib/sanitize";
+import { verifyForwardEmailSender } from "@/lib/forwardemail-verify";
 import {
   logReceiverEvent,
   secretsEqual,
@@ -109,9 +123,14 @@ export async function POST(request: Request) {
   const rl = rateLimit(`inbound:${ip}`, 120, 60_000);
   if (!rl.allowed) return error("Rate limit exceeded.", 429);
 
-  const secret = process.env.INBOUND_API_SECRET;
-  if (!secret) {
-    console.error("INBOUND_API_SECRET is not configured");
+  // --- Authentication: token AND sender IP (both must pass) --------------
+  // The webhook URL is published in a public DNS TXT record, so the token
+  // in it is public by design — the reverse-DNS sender check is what
+  // actually proves the request came from ForwardEmail.
+  const webhookToken = process.env.FORWARDEMAIL_WEBHOOK_TOKEN;
+  const inboundSecret = process.env.INBOUND_API_SECRET;
+  if (!webhookToken && !inboundSecret) {
+    console.error("No ForwardEmail webhook token is configured");
     return error("Inbound endpoint is not configured.", 503);
   }
 
@@ -125,14 +144,30 @@ export async function POST(request: Request) {
     return error("Event too large.", 413);
   }
 
-  // --- Authentication: secret query param (no signature on free plan) ----
   const url = new URL(request.url);
   const token = url.searchParams.get("token") ?? "";
-  const tokenValid = token !== "" && secretsEqual(token, secret);
+  const tokenValid =
+    token !== "" &&
+    ((webhookToken !== undefined && secretsEqual(token, webhookToken)) ||
+      (inboundSecret !== undefined && secretsEqual(token, inboundSecret)));
   if (!tokenValid) {
     // Never log the token value.
     await logReceiverEvent(null, false, "rejected_auth", "invalid token");
     return error("Invalid token.", 401);
+  }
+
+  const senderCheck = await verifyForwardEmailSender(request);
+  if (!senderCheck.ok) {
+    // The connecting IP is operational telemetry (visible in normal server
+    // logs); recording it makes a failed ForwardEmail delivery diagnosable
+    // from the admin receiver-events list. The token is never logged.
+    await logReceiverEvent(
+      null,
+      false,
+      "rejected_auth",
+      `sender IP verification failed (ip=${senderCheck.ip})`
+    );
+    return error("Sender verification failed.", 401);
   }
 
   // --- Parse ---------------------------------------------------------------
