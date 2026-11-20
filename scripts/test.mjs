@@ -253,7 +253,105 @@ async function main() {
       `html=${html.slice(0, 120)}`
     );
 
-    // 15. Normal user cannot access admin APIs
+    // 15. ForwardEmail webhook adapter --------------------------------------
+    // Payload shape: mailparser simpleParser output as ForwardEmail posts it.
+    const secondAddress = [...seen].find((a) => a !== address);
+    const fePayload = (messageId, recips) => ({
+      attachments: [],
+      headers: "From: Random Sender <random@example.com>\r\n",
+      headerLines: [],
+      html: `<p>Your verification code is <b>739201</b>.</p><script>alert('xss')</script><img src="https://tracker.example.com/pixel.png">`,
+      text: "Your verification code is 739201. It expires in 10 minutes.",
+      textAsHtml: "<p>Your verification code is 739201.</p>",
+      date: new Date().toISOString(),
+      from: {
+        value: [{ address: "random@example.com", name: "Random Sender" }],
+        html: "Random Sender &lt;random@example.com&gt;",
+        text: "Random Sender <random@example.com>",
+      },
+      to: {
+        value: [{ address, name: "" }],
+        html: address,
+        text: address,
+      },
+      subject: "Your verification code",
+      messageId,
+      raw: "From: random@example.com\r\nSubject: Your verification code\r\n\r\nYour verification code is 739201.",
+      recipients: recips,
+      session: {
+        recipient: address,
+        remoteAddress: "1.2.3.4",
+        clientHostname: "mx.forwardemail.net",
+        sender: "random@example.com",
+        mta: "mx.forwardemail.net",
+        arrivalDate: new Date().toISOString(),
+      },
+    });
+    const fePath = `/api/inbound-email/forwardemail?token=${INBOUND_SECRET}`;
+    const feBody = fePayload(`<69ad5fc2-${stamp}@example.net>`, [address]);
+
+    r = await req(null, "/api/inbound-email/forwardemail", "POST", feBody);
+    check("ForwardEmail webhook without token rejected (401)", r.status === 401, `status=${r.status}`);
+    r = await req(null, "/api/inbound-email/forwardemail?token=wrong-token", "POST", feBody);
+    check("ForwardEmail webhook with wrong token rejected (401)", r.status === 401, `status=${r.status}`);
+
+    r = await req(null, fePath, "POST", feBody);
+    const feMessageDbId = r.data.results?.[0]?.messageDbId;
+    check(
+      "ForwardEmail webhook with token stores message + detects OTP 739201",
+      r.status === 200 && r.data.results?.[0]?.status === "stored" && r.data.results?.[0]?.otpDetected === "739201",
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    r = await req(null, fePath, "POST", feBody);
+    check("ForwardEmail webhook replay rejected as duplicate (409)", r.status === 409, `status=${r.status}`);
+
+    r = await req(null, fePath, "POST", fePayload(`<69ad5fc2-${stamp}-unknown@example.net>`, ["nobody@manangmails.is-a.dev"]));
+    check("ForwardEmail webhook with unknown recipient rejected (404)", r.status === 404, `status=${r.status}`);
+
+    // Multi-recipient: one request carries two of our addresses.
+    const feMulti = fePayload(`<69ad5fc2-${stamp}-multi@example.net>`, [address, secondAddress]);
+    r = await req(null, fePath, "POST", feMulti);
+    const multiStored =
+      r.status === 200 &&
+      r.data.results?.length === 2 &&
+      r.data.results.every((x) => x.status === "stored");
+    check("ForwardEmail webhook stores one message per recipient (2 stored)", multiStored, `status=${r.status} ${JSON.stringify(r.data)}`);
+    const feMultiIds = (r.data.results ?? []).map((x) => x.messageDbId);
+    r = await req(null, fePath, "POST", feMulti);
+    check("ForwardEmail multi-recipient replay rejected as duplicate (409)", r.status === 409, `status=${r.status}`);
+
+    // Missing messageId: stable derived id, replay still dedupes.
+    const feNoId = fePayload(undefined, [address]);
+    delete feNoId.messageId;
+    r = await req(null, fePath, "POST", feNoId);
+    check("ForwardEmail webhook without messageId stores with derived id (200)", r.status === 200 && r.data.results?.[0]?.status === "stored", `status=${r.status} ${JSON.stringify(r.data)}`);
+    r = await req(null, fePath, "POST", feNoId);
+    check("ForwardEmail derived-id replay rejected as duplicate (409)", r.status === 409, `status=${r.status}`);
+
+    // ForwardEmail-stored message is visible in inbox + OTP page, sanitized.
+    r = await req(user, "/api/messages");
+    check(
+      "Inbox lists ForwardEmail messages (single + multi-recipient)",
+      r.status === 200 &&
+        [feMessageDbId, ...feMultiIds].every((id) => r.data.messages?.some((m) => m.id === id)),
+      `status=${r.status} total=${r.data.total}`
+    );
+    r = await req(user, "/api/otp");
+    check(
+      "OTP page lists ForwardEmail code 739201",
+      r.status === 200 && r.data.otps?.some((o) => o.code === "739201"),
+      `status=${r.status}`
+    );
+    r = await req(user, `/api/messages/${feMessageDbId}`);
+    const feHtml = r.data.message?.safe_html_body ?? "";
+    check(
+      "ForwardEmail HTML sanitized (no <script>, no remote <img>)",
+      r.status === 200 && !/<script/i.test(feHtml) && !/tracker\.example\.com/.test(feHtml) && /739201/.test(feHtml),
+      `html=${feHtml.slice(0, 120)}`
+    );
+
+    // 16. Normal user cannot access admin APIs
     r = await req(user, "/api/admin/users");
     check("Normal user denied admin API (401)", r.status === 401, `status=${r.status}`);
     r = await req(user, "/api/admin/overview");
