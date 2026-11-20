@@ -20,6 +20,7 @@ export default function RootLayout({
             ✉️ Private Email Platform
           </a>
           <nav>
+            <a href="/public">Public addresses</a>
             <a href="/dashboard">Dashboard</a>
             <a href="/dashboard/inbox">Inbox</a>
             <a href="/dashboard/addresses">My Addresses</a>

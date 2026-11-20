@@ -3,6 +3,7 @@
 // signup/login are rate-limited instead. Username must be unique.
 import { NextResponse } from "next/server";
 import { hashPassword } from "@/lib/auth";
+import { PUBLIC_POOL_USERNAME } from "@/lib/public-pool";
 import { query, getSetting } from "@/lib/db";
 import { clientIp, rateLimit } from "@/lib/rate-limit";
 import { error, json, isValidPassword, isValidUsername, maintenanceModeOn, parseJsonBody } from "@/lib/api";
@@ -18,6 +19,10 @@ export async function POST(request: Request) {
 
   if (typeof username !== "string" || !isValidUsername(username)) {
     return error("Username must be 3–50 characters: letters, numbers, _ . -", 400);
+  }
+  if (username === PUBLIC_POOL_USERNAME) {
+    // Reserved: the system account that owns the public address pool.
+    return error("That username is reserved. Choose another one.", 400);
   }
   if (typeof password !== "string" || !isValidPassword(password)) {
     return error("Password must be at least 8 characters.", 400);

@@ -402,6 +402,113 @@ async function main() {
       `status=${r.status} ${JSON.stringify(r.data)}`
     );
 
+    // 15c. Public address pool (150 ready-made addresses, no login) --------
+    // (a) Seed with wrong / missing token -> 401
+    r = await req(null, "/api/seed-public", "POST", { setupToken: "wrong-token" });
+    check("Seed public pool with wrong token rejected (401)", r.status === 401, `status=${r.status}`);
+    r = await req(null, "/api/seed-public", "POST", {});
+    check("Seed public pool with missing token rejected (401)", r.status === 401, `status=${r.status}`);
+
+    // (b) Seed with correct token -> 150 created
+    r = await req(null, "/api/seed-public", "POST", { setupToken: SETUP_TOKEN });
+    check(
+      "Seed public pool with correct token creates 150 addresses",
+      r.status === 200 && r.data.created === 150 && r.data.total === 150,
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    // (c) Seed again -> 0 new, total still 150
+    r = await req(null, "/api/seed-public", "POST", { setupToken: SETUP_TOKEN });
+    check(
+      "Re-seeding the public pool is idempotent (0 created, total 150)",
+      r.status === 200 && r.data.created === 0 && r.data.existing === 150 && r.data.total === 150,
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    // Public list API (no session): 150 addresses, private address absent.
+    r = await req(null, "/api/public/addresses");
+    const publicList = r.data.addresses ?? [];
+    const seededAddress = publicList[0]?.full_address;
+    const seededLocal = publicList[0]?.local_part;
+    check(
+      "Public address list returns 150 addresses without login",
+      r.status === 200 && r.data.total === 150 && publicList.length === 150,
+      `status=${r.status} total=${r.data.total}`
+    );
+    check(
+      "Private address is NOT in the public address list",
+      !publicList.some((a) => a.full_address === address),
+      "private address leaked into public list"
+    );
+
+    // (e) Public inbox for a private address -> 404; unknown -> 404.
+    r = await req(null, `/api/public/inbox?address=${encodeURIComponent(address)}`);
+    check("Public inbox for a private address rejected (404)", r.status === 404, `status=${r.status}`);
+    r = await req(null, "/api/public/inbox?address=nobody@manangmails.is-a.dev");
+    check("Public inbox for an unknown address rejected (404)", r.status === 404, `status=${r.status}`);
+    r = await req(null, "/api/public/inbox");
+    check("Public inbox without ?address= rejected (400)", r.status === 400, `status=${r.status}`);
+
+    // (f) Mail delivered via the ForwardEmail adapter to a seeded address
+    //     lands in its public inbox.
+    const fePublic = fePayload(`<69ad5fc2-${stamp}-public@example.net>`, [seededAddress]);
+    r = await req(null, fePath, "POST", fePublic);
+    const publicMessageDbId = r.data.results?.[0]?.messageDbId;
+    check(
+      "ForwardEmail webhook stores mail for a seeded public address",
+      r.status === 200 && r.data.results?.[0]?.status === "stored" && r.data.results?.[0]?.otpDetected === "739201",
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    // (d) Public inbox WITHOUT any session -> 200 with its messages.
+    r = await req(null, `/api/public/inbox?address=${encodeURIComponent(seededAddress)}`);
+    check(
+      "Public inbox returns the seeded address's messages without login",
+      r.status === 200 && r.data.messages?.some((m) => m.id === publicMessageDbId),
+      `status=${r.status} total=${r.data.total}`
+    );
+
+    // The public message must NOT appear in the private user's inbox.
+    r = await req(user, "/api/messages");
+    check(
+      "Public-pool message does NOT leak into the private inbox",
+      r.status === 200 && !r.data.messages?.some((m) => m.id === publicMessageDbId),
+      `status=${r.status} total=${r.data.total}`
+    );
+
+    // Public pages render (no login); a private local-part 404s.
+    const fetchPage = async (path) => {
+      const res = await fetch(`${BASE}${path}`);
+      return { status: res.status, text: await res.text() };
+    };
+    let page = await fetchPage("/");
+    check(
+      "Homepage lists public addresses and links to /public",
+      page.status === 200 && page.text.includes(seededAddress) && page.text.includes("/public"),
+      `status=${page.status}`
+    );
+    page = await fetchPage("/public");
+    check(
+      "Public list page renders pool addresses without login",
+      page.status === 200 && page.text.includes(seededAddress),
+      `status=${page.status}`
+    );
+    page = await fetchPage(`/public/${seededLocal}`);
+    check(
+      "Public inbox page renders the delivered message without login",
+      page.status === 200 && page.text.includes("Your verification code"),
+      `status=${page.status}`
+    );
+    page = await fetchPage(`/public/${seededLocal}/${publicMessageDbId}`);
+    check(
+      "Public message page shows the OTP code without login",
+      page.status === 200 && page.text.includes("739201"),
+      `status=${page.status}`
+    );
+    const privateLocal = address.split("@")[0];
+    page = await fetchPage(`/public/${privateLocal}`);
+    check("Public inbox page for a private address is 404", page.status === 404, `status=${page.status}`);
+
     // 16. Normal user cannot access admin APIs
     r = await req(user, "/api/admin/users");
     check("Normal user denied admin API (401)", r.status === 401, `status=${r.status}`);

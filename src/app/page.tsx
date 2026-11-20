@@ -1,10 +1,14 @@
 import { getSetting, receiverStatusLabel } from "@/lib/db";
+import CopyButton from "@/components/CopyButton";
+import { listPublicAddresses, PUBLIC_POOL_SIZE } from "@/lib/public-pool";
 
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
   const status = await receiverStatusLabel().catch(() => "NOT_CONFIGURED" as const);
   const domain = (await getSetting("domain").catch(() => null)) ?? "yourdomain.com";
+  const publicAddresses = await listPublicAddresses().catch(() => []);
+  const preview = publicAddresses.slice(0, 8);
   const receiving =
     status === "CONNECTED" ? (
       <span className="badge ok">Receiving: CONNECTED</span>
@@ -62,6 +66,46 @@ export default async function Home() {
           Passwords are stored only as secure hashes and are never shown to
           administrators. This platform receives email; it never asks for or
           stores passwords belonging to other services.
+        </p>
+      </div>
+
+      <div className="card">
+        <h2>Ready-made addresses — no login needed</h2>
+        {publicAddresses.length === 0 ? (
+          <p className="muted">
+            {PUBLIC_POOL_SIZE} ready-made public addresses are being set up —
+            check back soon.
+          </p>
+        ) : (
+          <>
+            <p className="muted">
+              {publicAddresses.length} addresses are ready to use right now.
+              Copy any one and use it — mail sent to it appears in its public
+              inbox. Anyone with the link can read a public inbox, so never
+              use one for anything private.
+            </p>
+            <table>
+              <tbody>
+                {preview.map((a) => (
+                  <tr key={a.id}>
+                    <td>
+                      <code>{a.full_address}</code>
+                    </td>
+                    <td>
+                      <CopyButton text={a.full_address} />{" "}
+                      <a href={`/public/${a.local_part}`}>Open inbox →</a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        )}
+        <p>
+          <a href="/public">
+            See all {publicAddresses.length || PUBLIC_POOL_SIZE} public
+            addresses →
+          </a>
         </p>
       </div>
     </>
