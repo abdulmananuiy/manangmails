@@ -16,13 +16,32 @@
 //    pool address is stored exactly like mail to a private address.
 import { hashPassword, randomToken } from "@/lib/auth";
 import { generateLocalPart, normalizeAddress } from "@/lib/addresses";
-import { getSetting, query } from "@/lib/db";
+import { getSetting, query, setSetting } from "@/lib/db";
 
 /** Reserved username of the system account that owns the public pool. */
 export const PUBLIC_POOL_USERNAME = "public-pool";
 
 /** Fixed size of the public pool. Seeding caps at this number. */
 export const PUBLIC_POOL_SIZE = 150;
+
+/**
+ * Strict domain validation for a platform email domain: a bare hostname
+ * only — lowercase, at least one dot, labels of [a-z0-9-] that never start
+ * or end with a hyphen, each at most 63 chars, total at most 253 chars.
+ * Anything else (protocol, slashes, spaces, uppercase, port, trailing
+ * dot, missing dot) is rejected. Used by POST /api/seed-public.
+ */
+export function isValidPublicDomain(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (value.length === 0 || value.length > 253) return false;
+  const labels = value.split(".");
+  if (labels.length < 2) return false;
+  for (const label of labels) {
+    if (label.length === 0 || label.length > 63) return false;
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(label)) return false;
+  }
+  return true;
+}
 
 export interface PublicAddressRow {
   id: number;
@@ -67,24 +86,30 @@ export async function ensurePublicOwner(): Promise<number> {
   }
 }
 
-/** All public (pool) addresses, newest last, with message counts. */
+/** All public (pool) addresses on the CURRENT platform domain with active
+ *  status, newest last, with message counts. Addresses from a previous
+ *  domain (deactivated by a domain switch) never appear here. */
 export async function listPublicAddresses(): Promise<PublicAddressRow[]> {
   const ownerId = await getPublicOwnerId();
   if (ownerId === null) return [];
+  const domain = ((await getSetting("domain")) ?? "yourdomain.com").toLowerCase();
   // NOTE: GROUP BY lists every selected column, not just the id.
   // Real Postgres would resolve the rest via the primary-key functional
   // dependency, but pg-mem (used by `npm test`) returns NULL for
   // non-grouped, non-aggregated columns — grouping by all of them returns
   // identical results on both.
+  // The local-part alphabet is [a-z0-9] only, so '%@' || domain matches
+  // exactly one domain suffix — never a subdomain of it.
   const { rows } = await query<PublicAddressRow>(
     `SELECT a.id, a.full_address, a.local_part, a.status, a.created_at,
             COUNT(m.id)::text AS message_count
      FROM email_addresses a
      LEFT JOIN messages m ON m.address_id = a.id
-     WHERE a.user_id = $1
+     WHERE a.user_id = $1 AND a.status = 'active'
+       AND LOWER(a.full_address) LIKE '%@' || $2
      GROUP BY a.id, a.full_address, a.local_part, a.status, a.created_at
      ORDER BY a.full_address ASC`,
-    [ownerId]
+    [ownerId, domain]
   );
   return rows;
 }
@@ -97,7 +122,9 @@ export function normalizePublicInput(raw: string, domain: string): string {
   return `${value}@${domain.trim().toLowerCase()}`;
 }
 
-/** One public address by local-part (case-insensitive), or null. */
+/** One ACTIVE public address by local-part (case-insensitive), or null.
+ *  Deactivated addresses (e.g. from a previous domain) are never returned,
+ *  so their public inbox pages 404. */
 export async function getPublicAddress(
   localPart: string
 ): Promise<PublicAddressRow | null> {
@@ -108,14 +135,16 @@ export async function getPublicAddress(
             COUNT(m.id)::text AS message_count
      FROM email_addresses a
      LEFT JOIN messages m ON m.address_id = a.id
-     WHERE a.user_id = $1 AND LOWER(a.local_part) = $2
+     WHERE a.user_id = $1 AND a.status = 'active' AND LOWER(a.local_part) = $2
      GROUP BY a.id, a.full_address, a.local_part, a.status, a.created_at`,
     [ownerId, localPart.trim().toLowerCase()]
   );
   return rows[0] ?? null;
 }
 
-/** One public address by full address (case-insensitive), or null. */
+/** One ACTIVE public address by full address (case-insensitive), or null.
+ *  Deactivated addresses (e.g. from a previous domain) are never returned,
+ *  so the public inbox API 404s for them. */
 export async function getPublicAddressByFull(
   fullAddress: string
 ): Promise<PublicAddressRow | null> {
@@ -126,7 +155,7 @@ export async function getPublicAddressByFull(
             COUNT(m.id)::text AS message_count
      FROM email_addresses a
      LEFT JOIN messages m ON m.address_id = a.id
-     WHERE a.user_id = $1 AND LOWER(a.full_address) = $2
+     WHERE a.user_id = $1 AND a.status = 'active' AND LOWER(a.full_address) = $2
      GROUP BY a.id, a.full_address, a.local_part, a.status, a.created_at`,
     [ownerId, fullAddress.trim().toLowerCase()]
   );
@@ -134,21 +163,61 @@ export async function getPublicAddressByFull(
 }
 
 /**
- * Create pool addresses until the pool holds PUBLIC_POOL_SIZE of them.
- * Idempotent: re-running creates 0 new addresses. Never deletes anything
- * and never creates an address outside the pool. Returns counts for the
- * seed endpoint's response.
+ * Create pool addresses until the pool holds PUBLIC_POOL_SIZE active
+ * addresses on the target domain. Idempotent per domain: re-running with
+ * the same domain creates 0 new addresses. Never deletes anything and
+ * never creates an address outside the pool. Returns counts for the seed
+ * endpoint's response.
+ *
+ * Domain switch: when `targetDomain` is given and differs from the current
+ * platform_settings.domain, the setting is updated first, then ALL active
+ * pool addresses on the old domain are marked 'deactivated' (the existing
+ * status value — no schema change), and 150 fresh unique addresses are
+ * seeded on the new domain. Old-domain addresses keep their stored mail
+ * but stop showing anywhere public. Re-running the switch with the same
+ * new domain is a no-op (switched=false, created=0).
  */
-export async function seedPublicPool(): Promise<{
+export async function seedPublicPool(targetDomain?: string): Promise<{
   created: number;
   existing: number;
   total: number;
+  domain: string;
+  switched: boolean;
+  deactivated: number;
 }> {
   const ownerId = await ensurePublicOwner();
-  const domain = (await getSetting("domain")) ?? "yourdomain.com";
+  const currentDomain = (await getSetting("domain")) ?? "yourdomain.com";
+  let domain = currentDomain;
+  let switched = false;
+  let deactivated = 0;
+  if (targetDomain !== undefined) {
+    if (!isValidPublicDomain(targetDomain)) {
+      throw new Error("Invalid domain.");
+    }
+    domain = targetDomain;
+    if (domain !== currentDomain) {
+      switched = true;
+      // Point the platform at the new domain, then retire the old pool.
+      // Deactivation is scoped to the old domain so nothing else is
+      // touched; by construction only pool addresses on the old domain
+      // are active at this point.
+      await setSetting("domain", domain);
+      const { rowCount } = await query(
+        `UPDATE email_addresses SET status = 'deactivated'
+         WHERE user_id = $1 AND status = 'active'
+           AND LOWER(full_address) LIKE '%@' || $2`,
+        [ownerId, currentDomain.toLowerCase()]
+      );
+      deactivated = rowCount;
+    }
+  }
+  // Active pool addresses on the (possibly new) domain only — after a
+  // switch this is 0, so a full fresh pool of 150 is created below.
   const { rows: countRows } = await query<{ c: string }>(
-    "SELECT COUNT(*)::text AS c FROM email_addresses WHERE user_id = $1 AND status = 'active'",
-    [ownerId]
+    `SELECT COUNT(*)::text AS c FROM email_addresses
+     WHERE user_id = $1 AND status = 'active'
+       AND LOWER(full_address) LIKE '%@' || $2`,
+    [ownerId, domain.toLowerCase()]
   );
   const existing = parseInt(countRows[0].c, 10);
   let created = 0;
@@ -178,5 +247,5 @@ export async function seedPublicPool(): Promise<{
       throw new Error("Could not generate a unique public address.");
     }
   }
-  return { created, existing, total: existing + created };
+  return { created, existing, total: existing + created, domain, switched, deactivated };
 }

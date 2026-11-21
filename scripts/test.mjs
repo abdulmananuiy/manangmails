@@ -509,6 +509,115 @@ async function main() {
     page = await fetchPage(`/public/${privateLocal}`);
     check("Public inbox page for a private address is 404", page.status === 404, `status=${page.status}`);
 
+    // 15d. Domain switch: move the public pool to a new domain ------------
+    const NEW_DOMAIN = "mail.50saas.site";
+
+    // (e) Invalid domain values -> 400 (token is valid, so 401 must not fire).
+    const badDomains = [
+      "https://mail.50saas.site",
+      "mail.50saas.site/",
+      "mail 50saas.site",
+      "MAIL.50SAAS.SITE",
+      "mail50saassite",
+      "mail.50saas.site:8080",
+      "",
+      "mail.50saas.site.",
+      "-mail.50saas.site",
+      "a".repeat(254),
+      123,
+    ];
+    let badRejected = true;
+    for (const bad of badDomains) {
+      r = await req(null, "/api/seed-public", "POST", { setupToken: SETUP_TOKEN, domain: bad });
+      if (r.status !== 400) badRejected = false;
+    }
+    check("Seed with invalid domain values rejected (400)", badRejected, `last status=${r.status}`);
+
+    // Wrong token still wins over an invalid domain (401, not 400).
+    r = await req(null, "/api/seed-public", "POST", { setupToken: "wrong-token", domain: "not a domain" });
+    check("Seed with wrong token + invalid domain rejected as 401", r.status === 401, `status=${r.status}`);
+
+    // (a) Seed with the new domain: setting switches, old 150 deactivated,
+    //     150 fresh addresses created on the new domain.
+    r = await req(null, "/api/seed-public", "POST", { setupToken: SETUP_TOKEN, domain: NEW_DOMAIN });
+    check(
+      "Seed with a new domain switches setting, deactivates old 150, creates 150 new",
+      r.status === 200 &&
+        r.data.created === 150 &&
+        r.data.total === 150 &&
+        r.data.domain === NEW_DOMAIN &&
+        r.data.switched === true &&
+        r.data.deactivated === 150,
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
+    // (b) Public list after the switch: exactly the 150 new-domain
+    //     addresses, none of the old ones.
+    r = await req(null, "/api/public/addresses");
+    const newList = r.data.addresses ?? [];
+    const newSeededAddress = newList[0]?.full_address;
+    const newSeededLocal = newList[0]?.local_part;
+    check(
+      "Public list after switch shows exactly 150 new-domain addresses",
+      r.status === 200 &&
+        r.data.total === 150 &&
+        r.data.domain === NEW_DOMAIN &&
+        newList.length === 150 &&
+        newList.every((a) => a.full_address.endsWith(`@${NEW_DOMAIN}`)) &&
+        !newList.some((a) => a.full_address === seededAddress),
+      `status=${r.status} total=${r.data.total} domain=${r.data.domain}`
+    );
+
+    // (c) Public inbox for an old-domain address -> 404 (API + page).
+    r = await req(null, `/api/public/inbox?address=${encodeURIComponent(seededAddress)}`);
+    check("Public inbox for an old-domain address rejected after switch (404)", r.status === 404, `status=${r.status}`);
+    page = await fetchPage(`/public/${seededLocal}`);
+    check("Public inbox page for an old-domain address is 404 after switch", page.status === 404, `status=${page.status}`);
+
+    // New-domain address works without login (API + page).
+    r = await req(null, `/api/public/inbox?address=${encodeURIComponent(newSeededAddress)}`);
+    check("Public inbox for a new-domain address works without login", r.status === 200, `status=${r.status}`);
+    page = await fetchPage(`/public/${newSeededLocal}`);
+    check(
+      "Public inbox page for a new-domain address renders without login",
+      page.status === 200 && page.text.includes(newSeededAddress),
+      `status=${page.status}`
+    );
+
+    // Homepage preview and /public page show only new-domain addresses.
+    page = await fetchPage("/");
+    check(
+      "Homepage preview shows only new-domain public addresses after switch",
+      page.status === 200 && page.text.includes(newSeededAddress) && !page.text.includes(seededAddress),
+      `status=${page.status}`
+    );
+    page = await fetchPage("/public");
+    check(
+      "Public list page shows only new-domain addresses after switch",
+      page.status === 200 && page.text.includes(newSeededAddress) && !page.text.includes(seededAddress),
+      `status=${page.status}`
+    );
+
+    // (d) Re-seed with the same new domain -> 0 new, total still 150.
+    r = await req(null, "/api/seed-public", "POST", { setupToken: SETUP_TOKEN, domain: NEW_DOMAIN });
+    check(
+      "Re-seeding with the same new domain is idempotent (0 created, total 150)",
+      r.status === 200 &&
+        r.data.created === 0 &&
+        r.data.existing === 150 &&
+        r.data.total === 150 &&
+        r.data.switched === false &&
+        r.data.deactivated === 0,
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+    // Re-seed with no domain at all -> uses the current domain, same result.
+    r = await req(null, "/api/seed-public", "POST", { setupToken: SETUP_TOKEN });
+    check(
+      "Re-seeding without a domain uses the current domain (0 created, total 150)",
+      r.status === 200 && r.data.created === 0 && r.data.total === 150 && r.data.domain === NEW_DOMAIN,
+      `status=${r.status} ${JSON.stringify(r.data)}`
+    );
+
     // 16. Normal user cannot access admin APIs
     r = await req(user, "/api/admin/users");
     check("Normal user denied admin API (401)", r.status === 401, `status=${r.status}`);
